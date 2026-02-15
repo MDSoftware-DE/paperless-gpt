@@ -161,6 +161,7 @@ type ClientInterface interface {
 	GetDocumentsByTags(ctx context.Context, tags []string, pageSize int) ([]Document, error)
 	UpdateDocuments(ctx context.Context, documents []DocumentSuggestion, db *gorm.DB, isUndo bool) error
 	GetDocument(ctx context.Context, documentID int) (Document, error)
+	GetDocumentOriginalFileName(ctx context.Context, documentID int) (string, error)
 	GetAllTags(ctx context.Context) (map[string]int, error)
 	GetAllCorrespondents(ctx context.Context) (map[string]int, error)
 	GetAllDocumentTypes(ctx context.Context) ([]DocumentType, error)

@@ -381,6 +381,9 @@ func (m *mockPaperlessClient) UpdateDocuments(ctx context.Context, documents []D
 func (m *mockPaperlessClient) GetDocument(ctx context.Context, documentID int) (Document, error) {
 	return Document{}, nil
 }
+func (m *mockPaperlessClient) GetDocumentOriginalFileName(ctx context.Context, documentID int) (string, error) {
+	return "", nil
+}
 func (m *mockPaperlessClient) GetAllTags(ctx context.Context) (map[string]int, error) {
 	return nil, nil
 }

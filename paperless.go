@@ -412,6 +412,32 @@ func (client *PaperlessClient) GetDocument(ctx context.Context, documentID int) 
 	}, nil
 }
 
+// GetDocumentOriginalFileName returns the original filename for a document with minimal overhead.
+//
+// This avoids calling GetDocument() (which resolves tags/correspondents/custom fields) when we only
+// need the filename for OCR artifact tracking.
+func (client *PaperlessClient) GetDocumentOriginalFileName(ctx context.Context, documentID int) (string, error) {
+	path := fmt.Sprintf("api/documents/%d/", documentID)
+	resp, err := client.Do(ctx, "GET", path, nil)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("error fetching document %d: %d, %s", documentID, resp.StatusCode, string(bodyBytes))
+	}
+
+	var out struct {
+		OriginalFileName string `json:"original_file_name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
+	}
+	return out.OriginalFileName, nil
+}
+
 // UpdateDocuments updates the specified documents with suggested changes
 func (client *PaperlessClient) UpdateDocuments(ctx context.Context, documents []DocumentSuggestion, db *gorm.DB, isUndo bool) error {
 	availableTags, err := client.GetAllTags(ctx)

@@ -61,6 +61,21 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 		return nil, fmt.Errorf("invalid ProcessMode: %s, must be one of: image, pdf, whole_pdf", processMode)
 	}
 
+	// Attach OCR request metadata so downstream routers can persist artifacts with stable IDs.
+	// This is best-effort only; OCR must keep working even if metadata lookup fails.
+	meta := ocr.RequestMetaFromContext(ctx)
+	if meta.DocumentID == 0 {
+		meta.DocumentID = documentID
+	}
+	if meta.OriginalFileName == "" {
+		if fn, err := app.Client.GetDocumentOriginalFileName(ctx, documentID); err == nil {
+			meta.OriginalFileName = fn
+		} else {
+			docLogger.WithError(err).Warn("Failed to fetch original filename for OCR tracking")
+		}
+	}
+	ctx = ocr.WithRequestMeta(ctx, meta)
+
 	// Skip OCR if PDF already has OCR
 	if app.pdfSkipExistingOCR && (processMode == "pdf" || processMode == "whole_pdf") {
 		docLogger.Infof("Checking for existing OCR in PDF document (mode: %s)...", processMode)

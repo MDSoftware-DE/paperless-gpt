@@ -75,6 +75,9 @@ func newLLMProvider(config Config) (*LLMProvider, error) {
 }
 
 func (p *LLMProvider) ProcessImage(ctx context.Context, imageContent []byte, pageNumber int) (*OCRResult, error) {
+	// Attach per-request metadata for downstream routers / artifact storage.
+	ctx = WithRequestMeta(ctx, RequestMeta{PageNumber: pageNumber})
+
 	logger := log.WithFields(logrus.Fields{
 		"provider": p.provider,
 		"model":    p.model,
@@ -178,10 +181,16 @@ func createOpenAIClient(config Config) (llms.Model, error) {
 	if apiKey == "" {
 		return nil, fmt.Errorf("OpenAI API key is not set")
 	}
-	return openai.New(
+	opts := []openai.Option{
 		openai.WithModel(config.VisionLLMModel),
 		openai.WithToken(apiKey),
-	)
+		openai.WithHTTPClient(createInstrumentedHTTPClient()),
+	}
+	// In our deployment this points to the local OCR router: http://glm-ocr-router:8088/v1
+	if baseURL := os.Getenv("OPENAI_BASE_URL"); baseURL != "" {
+		opts = append(opts, openai.WithBaseURL(baseURL))
+	}
+	return openai.New(opts...)
 }
 
 // createOllamaClient creates a new Ollama vision model client

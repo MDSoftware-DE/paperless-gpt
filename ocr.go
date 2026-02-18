@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -249,7 +250,8 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 		}
 	} else {
 		// Process pages as images
-		imagePaths, imgPageCount, err := app.Client.DownloadDocumentAsImages(ctx, documentID, pageLimit)
+		var err error
+		imagePaths, totalPdfPages, err = app.Client.DownloadDocumentAsImages(ctx, documentID, pageLimit)
 		defer func() {
 			for _, imagePath := range imagePaths {
 				if err := os.Remove(imagePath); err != nil {
@@ -260,8 +262,6 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 		if err != nil {
 			return nil, fmt.Errorf("error downloading document images for document %d: %w", documentID, err)
 		}
-
-		totalPdfPages = imgPageCount
 
 		if jobID != "" {
 			jobStore.Lock()
@@ -409,11 +409,18 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 							err = fmt.Errorf("no suitable data available for PDF generation")
 						}
 
-						if err != nil {
-							docLogger.WithError(err).Error("Failed to apply OCR to PDF")
-						} else {
-							// Store PDF data in the processed document struct
-							processedDoc.PDFData = pdfData
+							if err != nil {
+								docLogger.WithError(err).Error("Failed to apply OCR to PDF")
+							} else {
+								// Some PDF viewers fail to expose fully transparent text (ca/CA=0.000)
+								// for selection/copy. Nudge OCR alpha to 0.010 to keep text selectable.
+								pdfData, alphaAdjusted := ensureSelectableOCRTextLayer(pdfData)
+								if alphaAdjusted {
+									docLogger.Debug("Adjusted OCR text layer alpha from 0.000 to 0.010 for better text selection")
+								}
+
+								// Store PDF data in the processed document struct
+								processedDoc.PDFData = pdfData
 
 							// Save the PDF to a file
 							if err := app.savePDFToFile(ctx, documentID, pdfData); err != nil {
@@ -441,6 +448,32 @@ func (app *App) ProcessDocumentOCR(ctx context.Context, documentID int, options 
 
 	docLogger.Info("OCR processing completed successfully")
 	return processedDoc, nil
+}
+
+// ensureSelectableOCRTextLayer adjusts fully transparent OCR alpha states to a tiny value.
+// This keeps the text effectively invisible while allowing selection in strict viewers.
+func ensureSelectableOCRTextLayer(pdfData []byte) ([]byte, bool) {
+	if len(pdfData) == 0 {
+		return pdfData, false
+	}
+
+	out := make([]byte, len(pdfData))
+	copy(out, pdfData)
+
+	changed := false
+	replacements := [][2][]byte{
+		{[]byte("/ca 0.000"), []byte("/ca 0.010")},
+		{[]byte("/CA 0.000"), []byte("/CA 0.010")},
+	}
+
+	for _, r := range replacements {
+		if bytes.Contains(out, r[0]) {
+			out = bytes.ReplaceAll(out, r[0], r[1])
+			changed = true
+		}
+	}
+
+	return out, changed
 }
 
 // saveHOCRToFile saves the hOCR HTML to a file
@@ -581,21 +614,23 @@ func (app *App) uploadProcessedPDF(ctx context.Context, documentID int, pdfData 
 
 		logger.Info("Waiting for document processing to complete before deletion...")
 
+		processedOK := false
 		for i := 0; i < maxRetries; i++ {
 			taskStatus, err := app.Client.GetTaskStatus(ctx, taskID)
 			if err != nil {
-				logger.WithError(err).Warn("Failed to check task status, proceeding with deletion anyway")
-				break
+				// Safety: never delete the original unless we can confirm successful ingestion.
+				return fmt.Errorf("failed to check task status, not deleting original document: %w", err)
 			}
 
 			status, ok := taskStatus["status"].(string)
 			if !ok {
-				logger.Warn("Could not determine task status, proceeding with deletion anyway")
-				break
+				// Safety: never delete the original unless we can confirm successful ingestion.
+				return fmt.Errorf("could not determine task status, not deleting original document")
 			}
 
 			if status == "SUCCESS" {
 				logger.Info("Document processing completed successfully")
+				processedOK = true
 				break
 			}
 
@@ -607,6 +642,10 @@ func (app *App) uploadProcessedPDF(ctx context.Context, documentID int, pdfData 
 				logger.Infof("Document still processing (status: %s), waiting %v before checking again", status, waitTime)
 				time.Sleep(waitTime)
 			}
+		}
+
+		if !processedOK {
+			return fmt.Errorf("document processing did not reach SUCCESS after %d retries, not deleting original document", maxRetries)
 		}
 
 		// Delete original document

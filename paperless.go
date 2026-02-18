@@ -1298,12 +1298,17 @@ func (client *PaperlessClient) GetTaskStatus(ctx context.Context, taskID string)
 		return nil, fmt.Errorf("error checking task status: %d, %s", resp.StatusCode, string(bodyBytes))
 	}
 
-	var result map[string]interface{}
+	// Paperless returns a list for this endpoint (even when filtering by task_id).
+	// Example: GET /api/tasks/?task_id=<uuid> -> [{"status":"SUCCESS",...}]
+	var result []map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("error parsing response: %w", err)
 	}
 
-	return result, nil
+	if len(result) == 0 {
+		return nil, fmt.Errorf("task not found: %s", taskID)
+	}
+	return result[0], nil
 }
 
 // CreateTag creates a new tag and returns its ID

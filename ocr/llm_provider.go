@@ -49,10 +49,16 @@ type syntheticLayoutRegion struct {
 }
 
 type syntheticLineBand struct {
+	X1        float64
+	Y1        float64
+	X2        float64
+	Y2        float64
+	WordSpans []syntheticWordSpan
+}
+
+type syntheticWordSpan struct {
 	X1 float64
-	Y1 float64
 	X2 float64
-	Y2 float64
 }
 
 func newLLMProvider(config Config) (*LLMProvider, error) {
@@ -329,8 +335,8 @@ func buildSyntheticHOCRPage(
 			continue
 		}
 		nonEmptyLines++
-		layoutRows += 1.0
 		maxLineRunes = maxInt(maxLineRunes, utf8.RuneCountInString(line))
+		layoutRows += 1.0
 	}
 	if nonEmptyLines == 0 {
 		nonEmptyLines = 1
@@ -352,17 +358,18 @@ func buildSyntheticHOCRPage(
 		regionWidth := regionX2 - regionX1
 		regionHeight := regionY2 - regionY1
 
-		// Only trust detected regions that are large enough to represent the real document text area.
-		if regionWidth > w*0.15 && regionHeight > h*0.10 {
-			// Expand slightly outward so selection starts near visual text edges.
+		// Horizontal bounds are often reliable even when vertical bounds are noisy.
+		if regionWidth > w*0.15 {
 			marginX = clampFloat(regionX1-maxFloat(2, w*0.004), 2, w-15)
-			topMargin = clampFloat(regionY1-maxFloat(4, h*0.010), 2, h-15)
-
 			usableWidth = clampFloat(
 				regionWidth+maxFloat(4, w*0.008),
 				20,
 				maxFloat(20, w-marginX-5),
 			)
+		}
+		// Only trust vertical bounds when they cover a substantial share of the page.
+		if regionHeight > h*0.55 {
+			topMargin = clampFloat(regionY1-maxFloat(4, h*0.010), 2, h-15)
 			usableHeight = clampFloat(
 				regionHeight+maxFloat(6, h*0.014),
 				20,
@@ -371,10 +378,8 @@ func buildSyntheticHOCRPage(
 			bottomMargin = maxFloat(5, h-(topMargin+usableHeight))
 		}
 	}
-	lineAdvance := clampFloat(usableHeight/layoutRows, 6, 22)
-	lineBoxHeight := clampFloat(lineAdvance*0.64, 4.2, lineAdvance*0.82)
-	baseCharWidth := clampFloat(usableWidth/float64(maxLineRunes), 2.0, 5.4)
-	baseSpaceWidth := maxFloat(baseCharWidth*0.88, 2.1)
+	lineAdvance := clampFloat(usableHeight/layoutRows, 4.8, 18)
+	lineBoxHeight := clampFloat(lineAdvance*0.58, 2.6, lineAdvance*0.74)
 	yCursor := topMargin
 
 	scaledBands := make([]syntheticLineBand, 0, len(lineBands))
@@ -384,6 +389,17 @@ func buildSyntheticHOCRPage(
 			Y1: clampFloat(b.Y1*scaleY, 0, h-2),
 			X2: clampFloat(b.X2*scaleX, 0, w-2),
 			Y2: clampFloat(b.Y2*scaleY, 0, h-2),
+		}
+		if len(b.WordSpans) > 0 {
+			sb.WordSpans = make([]syntheticWordSpan, 0, len(b.WordSpans))
+			for _, ws := range b.WordSpans {
+				x1 := clampFloat(ws.X1*scaleX, 0, w-2)
+				x2 := clampFloat(ws.X2*scaleX, x1+1, w-2)
+				if x2 <= x1+0.8 {
+					continue
+				}
+				sb.WordSpans = append(sb.WordSpans, syntheticWordSpan{X1: x1, X2: x2})
+			}
 		}
 		if sb.X2 <= sb.X1+2 || sb.Y2 <= sb.Y1+1 {
 			continue
@@ -398,84 +414,50 @@ func buildSyntheticHOCRPage(
 	if nonEmptyLines > 0 {
 		bandRatio = float64(len(scaledBands)) / float64(nonEmptyLines)
 	}
-	// Use detected line bands only when density is close to expected line count.
-	// This avoids collapsing many OCR lines onto too few noisy bands.
-	useBands := len(scaledBands) >= 8 && bandRatio >= 0.99 && bandRatio <= 1.03
+	minBandsRequired := minInt(nonEmptyLines, 6)
+	if minBandsRequired < 3 {
+		minBandsRequired = 3
+	}
+	// Accept a broader ratio window: line-band detection is often slightly over/under
+	// segmented, but still good enough to anchor word-level x positions.
+	useBands := len(scaledBands) >= minBandsRequired && bandRatio >= 0.70 && bandRatio <= 1.35
+
+	// Strict but non-destructive vertical text corridor.
+	// Keep bottom close to the synthetic layout area to avoid clipping long documents.
+	textTop := clampFloat(topMargin, 2, h-20)
+	textBottom := clampFloat(topMargin+usableHeight, textTop+20, h-2)
+
 	renderedLines := 0
-	lastY2 := topMargin - lineBoxHeight
-	// Start slightly above the estimated top margin so first visible lines
-	// remain selectable even when region detection is conservative.
-	startShift := minFloat(topMargin*0.92, lineAdvance*3.2)
-	yCursor = maxFloat(2, topMargin-startShift)
+	lastY2 := textTop - lineBoxHeight
+	// Start directly at the detected/derived top so early lines are not lost.
+	yCursor = textTop
 
 	hocrLines := make([]hocr.Line, 0, len(lines))
 	for i, lineText := range lines {
 		if lineText == "" {
-			yCursor += lineAdvance * 0.45
+			yCursor += lineAdvance * 0.35
 			continue
 		}
 
 		remainingLines := maxInt(nonEmptyLines-renderedLines, 1)
-		availableHeight := maxFloat(8, (h-2)-yCursor)
+		availableHeight := maxFloat(6, textBottom-yCursor)
 		dynAdvance := minFloat(lineAdvance, availableHeight/float64(remainingLines))
-		dynAdvance = clampFloat(dynAdvance, 3.8, lineAdvance)
-		dynBoxHeight := clampFloat(lineBoxHeight*(dynAdvance/lineAdvance), 2.8, dynAdvance*0.82)
+		dynAdvance = clampFloat(dynAdvance, 2.8, lineAdvance)
+		dynBoxHeight := clampFloat(minFloat(lineBoxHeight, dynAdvance*0.72), 2.4, dynAdvance*0.72)
 
 		fallbackY1 := yCursor
 		y1 := fallbackY1
-		if y1 >= h-5 {
+		if y1 >= textBottom-2.2 {
 			break
 		}
-		fallbackY2 := minFloat(y1+dynBoxHeight, h-2)
+		fallbackY2 := minFloat(y1+dynBoxHeight, textBottom)
 		y2 := fallbackY2
-		if y2 <= y1 {
-			y2 = minFloat(y1+12, h-2)
-		}
 		yCursor += dynAdvance
 
 		words := normalizeSyntheticWords(strings.Fields(lineText))
 		if len(words) == 0 {
 			words = []string{" "}
 		}
-
-		lineMarginX := marginX
-		lineUsableWidth := usableWidth
-		if useBands {
-			bi := mapLineIndex(renderedLines, nonEmptyLines, len(scaledBands))
-			if bi >= 0 && bi < len(scaledBands) {
-				band := scaledBands[bi]
-					// Keep X placement stable from the synthetic model to avoid horizontal jitter.
-					// Use detected bands only as a bounded vertical hint to keep selection smooth.
-					fallbackCenter := (fallbackY1 + fallbackY2) / 2
-					bandCenter := (band.Y1 + band.Y2) / 2
-					maxShift := maxFloat(2, dynAdvance*0.30)
-					centerShift := clampFloat(bandCenter-fallbackCenter, -maxShift, maxShift)
-					targetCenter := fallbackCenter + centerShift
-					targetHeight := clampFloat(band.Y2-band.Y1, dynBoxHeight*0.85, dynBoxHeight*1.05)
-					y1 = targetCenter - (targetHeight / 2)
-					y2 = targetCenter + (targetHeight / 2)
-				}
-			}
-			// Enforce monotonic line progression; overlapping lines make UI text selection unusable.
-			minY1 := lastY2 + maxFloat(1.6, dynAdvance*0.20)
-			if y1 < minY1 {
-				shift := minY1 - y1
-				y1 += shift
-				y2 += shift
-		}
-		if y2 > h-2 {
-			shift := y2 - (h - 2)
-			y1 -= shift
-			y2 -= shift
-		}
-		if y1 < 2 {
-			shift := 2 - y1
-			y1 += shift
-			y2 += shift
-		}
-		y1 = clampFloat(y1, 2, h-6)
-		y2 = clampFloat(maxFloat(y2, y1+3), y1+3, h-2)
-		lastY2 = y2
 
 		lineRuneCount := 0
 		for _, word := range words {
@@ -485,23 +467,133 @@ func buildSyntheticHOCRPage(
 		if lineRuneCount+lineSpaceCount <= 0 {
 			lineRuneCount = 1
 		}
-			lineCharWidth := clampFloat(
-				lineUsableWidth/float64(lineRuneCount+lineSpaceCount),
-				baseCharWidth*0.76,
-				baseCharWidth*1.12,
-			)
-			lineSpaceWidth := maxFloat(lineCharWidth*0.92, baseSpaceWidth)
+		lineMarginX := marginX
+		lineUsableWidth := usableWidth
+		lineUnits := float64(lineRuneCount + lineSpaceCount)
+		baseCharWidth := clampFloat(usableWidth/float64(maxLineRunes), 2.2, 5.2)
+		lineContentWidth := estimateLineTextWidth(words, baseCharWidth)
+		lineContentWidth = clampFloat(lineContentWidth, 12.0, lineUsableWidth)
+		lineCharWidth := clampFloat(lineContentWidth/lineUnits, 2.2, 5.0)
+		lineContentWidth = clampFloat(lineContentWidth, lineCharWidth*lineUnits, lineUsableWidth)
+		lineSpaceWidth := maxFloat(lineCharWidth*1.12, 2.0)
+		mappedWordSpans := []syntheticWordSpan(nil)
+		if useBands {
+			bi := mapLineIndex(renderedLines, nonEmptyLines, len(scaledBands))
+			if bi >= 0 && bi < len(scaledBands) {
+				band := scaledBands[bi]
+				// Keep X placement stable from the synthetic model to avoid horizontal jitter.
+				// Use detected bands only as a bounded vertical hint.
+				fallbackCenter := (fallbackY1 + fallbackY2) / 2
+				bandCenter := (band.Y1 + band.Y2) / 2
+				maxShift := maxFloat(1.8, dynAdvance*0.22)
+				centerShift := clampFloat(bandCenter-fallbackCenter, -maxShift, maxShift)
+				targetCenter := fallbackCenter + centerShift
+				targetHeight := minFloat(band.Y2-band.Y1, dynAdvance*0.72)
+				targetHeight = clampFloat(targetHeight, 2.4, dynAdvance*0.72)
+				y1 = targetCenter - (targetHeight / 2)
+				y2 = targetCenter + (targetHeight / 2)
+
+				// For horizontal placement, trust the detected band bounds with a strong blend.
+				// This keeps right-edge alignment close to the visible text on scans/receipts.
+				detectedX1 := clampFloat(band.X1-maxFloat(2, w*0.004), 2, w-20)
+				detectedX2 := clampFloat(band.X2+maxFloat(4, w*0.010), detectedX1+20, w-2)
+				detectedWidth := detectedX2 - detectedX1
+				if detectedWidth >= maxFloat(20, usableWidth*0.20) {
+					baseRight := lineMarginX + lineUsableWidth
+					blendX := 0.70
+					lineMarginX = clampFloat((lineMarginX*(1.0-blendX))+(detectedX1*blendX), 2, w-20)
+					lineRight := clampFloat((baseRight*(1.0-blendX))+(detectedX2*blendX), lineMarginX+20, w-2)
+					lineUsableWidth = maxFloat(20, lineRight-lineMarginX)
+					lineContentWidth = clampFloat(lineRight-lineMarginX, lineUsableWidth*0.16, lineUsableWidth)
+					lineCharWidth = clampFloat(lineContentWidth/lineUnits, 2.2, 5.0)
+					lineSpaceWidth = maxFloat(lineCharWidth*1.12, 2.0)
+				}
+
+				mappedWordSpans = mapWordsToSpans(
+					words,
+					band.WordSpans,
+					lineMarginX,
+					lineContentWidth,
+					w,
+					lineCharWidth,
+				)
+				if !wordSpanMappingUsable(
+					mappedWordSpans,
+					words,
+					lineMarginX,
+					lineContentWidth,
+					lineCharWidth,
+				) {
+					mappedWordSpans = nil
+				}
+			}
+		}
+
+		// Enforce monotonic line progression; overlapping lines make UI text selection unreliable.
+		minY1 := lastY2 + maxFloat(1.4, dynAdvance*0.75)
+		if y1 < minY1 {
+			shift := minY1 - y1
+			y1 += shift
+			y2 += shift
+		}
+		if y2 > textBottom {
+			shift := y2 - textBottom
+			y1 -= shift
+			y2 -= shift
+		}
+		if y1 < textTop {
+			shift := textTop - y1
+			y1 += shift
+			y2 += shift
+		}
+
+		y1 = clampFloat(y1, textTop, textBottom-2.2)
+		y2 = clampFloat(maxFloat(y2, y1+2.2), y1+2.2, textBottom)
+
+		// Prevent accidental bleed into neighboring lines when selection is rendered by PDF viewers.
+		lineMaxHeight := dynAdvance * 0.4
+		if y2-y1 > lineMaxHeight {
+			y2 = y1 + lineMaxHeight
+		}
+		if y2 > textBottom {
+			y2 = textBottom
+		}
+
+		// Keep the final rendered line strictly inside the visible text corridor.
+		if remainingLines == 1 {
+			hardBottom := textBottom - maxFloat(0.6, dynBoxHeight*0.16)
+			if hardBottom > y1+2.2 {
+				y2 = minFloat(y2, hardBottom)
+			}
+		}
+		lastY2 = y2
+
+		fallbackLineSpaceX := lineMarginX
+		fallbackLineEnd := lineMarginX + lineContentWidth
+		if len(mappedWordSpans) == 0 {
+			fallbackLineSpaceX = lineMarginX
+			fallbackLineEnd = minFloat(lineMarginX+lineUsableWidth, w-2)
+		} else if len(mappedWordSpans) == len(words) {
+			fallbackLineSpaceX = mappedWordSpans[0].X1
+			fallbackLineEnd = mappedWordSpans[len(mappedWordSpans)-1].X2
+		}
 
 		wordObjs := make([]hocr.Word, 0, len(words))
-		xCursor := lineMarginX
 		for wIdx, word := range words {
 			charCount := maxInt(utf8.RuneCountInString(word), 1)
-			ww := maxFloat(float64(charCount)*lineCharWidth, lineCharWidth)
-			x1 := xCursor
+			var x1, x2 float64
+			if wIdx < len(mappedWordSpans) {
+				x1 = mappedWordSpans[wIdx].X1
+				x2 = mappedWordSpans[wIdx].X2
+			} else {
+				ww := maxFloat(float64(charCount)*lineCharWidth, lineCharWidth)
+				x1 = fallbackLineSpaceX
+				x2 = minFloat(x1+ww, fallbackLineEnd)
+				fallbackLineSpaceX = minFloat(x2+lineSpaceWidth, fallbackLineEnd)
+			}
 			if x1 >= w-2 {
 				break
 			}
-			x2 := minFloat(x1+ww, w-2)
 			if x2 <= x1 {
 				x2 = minFloat(x1+6, w-2)
 			}
@@ -512,10 +604,18 @@ func buildSyntheticHOCRPage(
 				Confidence: 85,
 				Lang:       "unknown",
 			})
-			xCursor = minFloat(x2+lineSpaceWidth, w-2)
 		}
 
-		lineBBox := hocr.NewBoundingBox(lineMarginX, y1, minFloat(lineMarginX+lineUsableWidth, w-2), y2)
+		lineLeft := fallbackLineSpaceX
+		lineRight := minFloat(lineMarginX+lineContentWidth, w-2)
+		if len(wordObjs) > 0 {
+			lineLeft = wordObjs[0].BBox.X1
+			lineRight = wordObjs[len(wordObjs)-1].BBox.X2
+		} else if len(mappedWordSpans) > 0 {
+			lineLeft = mappedWordSpans[0].X1
+			lineRight = mappedWordSpans[len(mappedWordSpans)-1].X2
+		}
+		lineBBox := hocr.NewBoundingBox(lineLeft, y1, lineRight, y2)
 		if len(wordObjs) > 0 {
 			lineBBox = hocr.NewBoundingBox(
 				wordObjs[0].BBox.X1,
@@ -529,9 +629,9 @@ func buildSyntheticHOCRPage(
 			ID:       fmt.Sprintf("line_%d_%d", pageNumber, i+1),
 			Lang:     "unknown",
 			BBox:     lineBBox,
-				Baseline: "0 0",
-				Words:    wordObjs,
-			})
+			Baseline: "0 0",
+			Words:    wordObjs,
+		})
 		renderedLines++
 	}
 
@@ -571,6 +671,298 @@ func mapLineIndex(lineIdx, totalLines, totalBands int) int {
 	pos := float64(lineIdx) / float64(totalLines-1)
 	idx := int(pos * float64(totalBands-1))
 	return clampInt(idx, 0, totalBands-1)
+}
+
+func mapWordsToSpans(
+	words []string,
+	spans []syntheticWordSpan,
+	lineX, lineWidth, pageW float64,
+	estimatedCharWidth float64,
+) []syntheticWordSpan {
+	if len(words) == 0 {
+		return nil
+	}
+	lineStart := clampFloat(lineX, 0, pageW-2)
+	lineEnd := clampFloat(lineX+lineWidth, lineStart+2, pageW-1)
+	lineStart = clampFloat(lineStart, 0, lineEnd-1)
+	lineEnd = clampFloat(lineEnd, lineStart+2, pageW-1)
+
+	clean := make([]syntheticWordSpan, 0, len(spans))
+	for _, s := range spans {
+		x1 := clampFloat(s.X1, lineStart, lineEnd-1)
+		x2 := clampFloat(s.X2, x1+1, lineEnd)
+		if x2-x1 < 0.8 {
+			continue
+		}
+		clean = append(clean, syntheticWordSpan{X1: x1, X2: x2})
+	}
+
+	base := distributeWordSpansByText(words, lineStart, lineEnd)
+	if len(base) == 0 {
+		return nil
+	}
+
+	out := base
+	if len(clean) > 0 {
+		if warped := warpWordSpansToGlyphSpans(base, clean, estimatedCharWidth); len(warped) == len(base) {
+			out = warped
+		}
+	}
+
+	// Enforce strict gutters and clamp to line bounds.
+	// This makes selections easier to split to word level in PDF text overlays.
+	minGap := clampFloat(maxFloat(estimatedCharWidth*0.22, 1.0), 1.0, 3.2)
+	for i := 0; i < len(out)-1; i++ {
+		if out[i].X2+minGap > out[i+1].X1 {
+			mid := (out[i].X2 + out[i+1].X1) / 2
+			out[i].X2 = mid - (minGap / 2)
+			out[i+1].X1 = mid + (minGap / 2)
+		}
+	}
+
+	for i := range out {
+		out[i].X1 = clampFloat(out[i].X1, lineStart, lineEnd-0.9)
+		out[i].X2 = clampFloat(maxFloat(out[i].X2, out[i].X1+1.2), out[i].X1+1.2, lineEnd)
+	}
+	// Keep widths readable and avoid huge width amplification caused by noisy spans.
+	minSpanWidth := maxFloat(2.0, estimatedCharWidth*0.8)
+	for i := range out {
+		if out[i].X2-out[i].X1 < minSpanWidth {
+			out[i].X2 = minFloat(out[i].X1+minSpanWidth, lineEnd)
+		}
+	}
+
+	// Prefer first/last spans to occupy available horizontal area so the visible
+	// line edges can be selected consistently.
+	if len(out) > 0 {
+		if out[0].X1 > lineStart+minSpanWidth {
+			out[0].X1 = lineStart
+		}
+		if out[len(out)-1].X2 < lineEnd-minSpanWidth {
+			out[len(out)-1].X2 = lineEnd
+		}
+	}
+	return out
+}
+
+func warpWordSpansToGlyphSpans(
+	base []syntheticWordSpan,
+	spans []syntheticWordSpan,
+	estimatedCharWidth float64,
+) []syntheticWordSpan {
+	if len(base) == 0 || len(spans) == 0 {
+		return base
+	}
+	if len(spans) == 1 {
+		span := spans[0]
+		for i := range base {
+			base[i] = span
+		}
+		return base
+	}
+
+	coverageTotal := 0.0
+	spanPrefix := make([]float64, len(spans))
+	for i, span := range spans {
+		w := maxFloat(span.X2-span.X1, 0)
+		coverageTotal += w
+		spanPrefix[i] = coverageTotal
+	}
+	if coverageTotal <= 0 {
+		return base
+	}
+
+	coverageToX := func(cov float64) float64 {
+		if cov <= 0 {
+			return spans[0].X1
+		}
+		if cov >= coverageTotal {
+			return spans[len(spans)-1].X2
+		}
+		remaining := cov
+		for i, span := range spans {
+			prev := 0.0
+			if i > 0 {
+				prev = spanPrefix[i-1]
+			}
+			spanW := maxFloat(spanPrefix[i]-prev, 0)
+			if remaining > spanW {
+				remaining -= spanW
+				continue
+			}
+			pos := span.X1 + remaining
+			if pos > span.X2 {
+				pos = span.X2
+			}
+			return pos
+		}
+		return spans[len(spans)-1].X2
+	}
+
+	lineStart := base[0].X1
+	lineEnd := base[len(base)-1].X2
+	lineWidth := maxFloat(lineEnd-lineStart, 1)
+	minSpanWidth := clampFloat(estimatedCharWidth*0.55, 1.2, 3.4)
+
+	// Build text boundaries and remap them to glyph coverage.
+	remapped := make([]float64, 0, len(base)+1)
+	remapped = append(remapped, base[0].X1)
+	for _, w := range base {
+		remapped = append(remapped, w.X2)
+	}
+	for i := 0; i < len(remapped); i++ {
+		ratio := clampFloat((remapped[i]-lineStart)/lineWidth, 0, 1)
+		remapped[i] = coverageToX(ratio * coverageTotal)
+	}
+
+	out := make([]syntheticWordSpan, 0, len(base))
+	for i := 0; i < len(base); i++ {
+		x1 := remapped[i]
+		x2 := remapped[i+1]
+		if x1 > x2 {
+			x1, x2 = x2, x1
+		}
+		if x2-x1 < minSpanWidth {
+			center := (x1 + x2) / 2
+			x1 = center - (minSpanWidth / 2)
+			x2 = center + (minSpanWidth / 2)
+		}
+		out = append(out, syntheticWordSpan{
+			X1: x1,
+			X2: x2,
+		})
+	}
+	return out
+}
+
+func estimateLineTextWidth(words []string, estimatedCharWidth float64) float64 {
+	if len(words) == 0 {
+		return 0
+	}
+	if estimatedCharWidth <= 0 {
+		estimatedCharWidth = 3.8
+	}
+
+	estimatedCharWidth = clampFloat(estimatedCharWidth, 1.6, 10.0)
+
+	widthUnits := 0.0
+	for _, word := range words {
+		wordLen := float64(maxInt(utf8.RuneCountInString(word), 1))
+		if isStandaloneSyntheticPunct(word) {
+			wordLen *= 0.65
+		}
+		widthUnits += wordLen
+	}
+	if len(words) > 1 {
+		widthUnits += float64(len(words)-1) * 0.9
+	}
+	if widthUnits <= 0 {
+		widthUnits = 1
+	}
+	return widthUnits * estimatedCharWidth
+}
+
+func wordSpanMappingUsable(
+	spans []syntheticWordSpan,
+	words []string,
+	lineX, lineWidth float64,
+	estimatedCharWidth float64,
+) bool {
+	if len(words) == 0 || len(spans) != len(words) {
+		return false
+	}
+	if lineWidth <= 2 {
+		return false
+	}
+	if estimatedCharWidth <= 0 {
+		return false
+	}
+
+	lineStart := lineX
+	lineEnd := lineX + lineWidth
+	prevX2 := lineStart - 1
+	totalSpanWidth := 0.0
+	nonTiny := 0
+	for i, s := range spans {
+		if s.X2 <= s.X1+0.6 {
+			return false
+		}
+		spanWidth := s.X2 - s.X1
+		word := words[i]
+		wordChars := maxInt(utf8.RuneCountInString(word), 1)
+		estimatedMin := maxFloat(estimatedCharWidth*0.45*float64(wordChars), 1.8)
+		estimatedMax := maxFloat(estimatedCharWidth*4.0*float64(wordChars), 14.0)
+		if spanWidth < estimatedMin || spanWidth > estimatedMax {
+			return false
+		}
+		if i > 0 && s.X1 < prevX2-0.8 {
+			return false
+		}
+		totalSpanWidth += spanWidth
+		if spanWidth >= 1.2 {
+			nonTiny++
+		}
+		prevX2 = s.X2
+	}
+	if nonTiny < maxInt(1, len(words)/2) {
+		return false
+	}
+
+	coverage := spans[len(spans)-1].X2 - spans[0].X1
+	if coverage < lineWidth*0.12 {
+		return false
+	}
+	if totalSpanWidth > lineWidth*1.9 {
+		return false
+	}
+	if spans[0].X1 > lineEnd || spans[len(spans)-1].X2 < lineStart {
+		return false
+	}
+	return true
+}
+
+func distributeWordSpansByText(words []string, x1, x2 float64) []syntheticWordSpan {
+	if len(words) == 0 {
+		return nil
+	}
+	if x2 <= x1+1 {
+		out := make([]syntheticWordSpan, len(words))
+		step := 1.0
+		for i := range words {
+			out[i] = syntheticWordSpan{X1: x1 + (float64(i) * step), X2: x1 + (float64(i+1) * step)}
+		}
+		return out
+	}
+
+	spaceUnits := 1.0
+	totalUnits := 0.0
+	wordUnits := make([]float64, len(words))
+	for i, w := range words {
+		u := float64(maxInt(utf8.RuneCountInString(w), 1))
+		wordUnits[i] = u
+		totalUnits += u
+	}
+	totalUnits += float64(maxInt(len(words)-1, 0)) * spaceUnits
+	if totalUnits <= 0 {
+		totalUnits = float64(len(words))
+	}
+
+	usable := x2 - x1
+	unitW := usable / totalUnits
+	spaceW := unitW * spaceUnits
+	out := make([]syntheticWordSpan, 0, len(words))
+	cursor := x1
+	for i, u := range wordUnits {
+		ww := maxFloat(0.9, u*unitW)
+		wx1 := cursor
+		wx2 := minFloat(wx1+ww, x2)
+		if i == len(wordUnits)-1 {
+			wx2 = x2
+		}
+		out = append(out, syntheticWordSpan{X1: wx1, X2: wx2})
+		cursor = minFloat(wx2+spaceW, x2)
+	}
+	return out
 }
 
 func normalizeSyntheticWords(words []string) []string {
@@ -716,6 +1108,16 @@ func detectTextRegion(img image.Image) syntheticLayoutRegion {
 	if !rowOK || !colOK {
 		return syntheticLayoutRegion{}
 	}
+	// Expand horizontal coverage using weighted dark-pixel quantiles.
+	// Dense-span alone can under-estimate sparse right-side text columns on receipts.
+	if qStart, qEnd, qOK := weightedSpan(colCounts, 0.001, 0.999); qOK {
+		if qStart < colStart {
+			colStart = qStart
+		}
+		if qEnd > colEnd {
+			colEnd = qEnd
+		}
+	}
 
 	minY = rowStart * step
 	maxY = minInt(h-1, ((rowEnd+1)*step)-1)
@@ -726,7 +1128,7 @@ func detectTextRegion(img image.Image) syntheticLayoutRegion {
 		return syntheticLayoutRegion{}
 	}
 
-	pad := maxInt(2, step*2)
+	pad := maxInt(3, step*4)
 	minX = maxInt(0, minX-pad)
 	minY = maxInt(0, minY-pad)
 	maxX = minInt(w-1, maxX+pad)
@@ -758,8 +1160,9 @@ func detectTextLineBands(img image.Image, region syntheticLayoutRegion) []synthe
 	xMin := 0
 	xMax := w - 1
 	if region.Valid {
-		xMin = clampInt(int(region.X1), 0, w-1)
-		xMax = clampInt(int(region.X2), xMin+1, w-1)
+		padX := maxInt(3, step*8)
+		xMin = clampInt(int(region.X1)-padX, 0, w-1)
+		xMax = clampInt(int(region.X2)+padX, xMin+1, w-1)
 	}
 	if xMax <= xMin {
 		return nil
@@ -866,14 +1269,141 @@ func detectTextLineBands(img image.Image, region syntheticLayoutRegion) []synthe
 		}
 		y1 := clampFloat(float64(r.s*step), 0, float64(h-1))
 		y2 := clampFloat(float64((r.e+1)*step-1), y1+1, float64(h-1))
+		bandYMin := maxInt(0, r.s*step)
+		bandYMax := minInt(h-1, ((r.e+1)*step)-1)
+		wordSpans := detectWordSpansInBand(img, minXR, maxXR, bandYMin, bandYMax, step, darkThreshold)
+		bandPad := maxInt(2, step*2)
 		out = append(out, syntheticLineBand{
-			X1: float64(maxInt(0, minXR-step)),
-			Y1: y1,
-			X2: float64(minInt(w-1, maxXR+step)),
-			Y2: y2,
+			X1:        float64(maxInt(0, minXR-bandPad)),
+			Y1:        y1,
+			X2:        float64(minInt(w-1, maxXR+bandPad)),
+			Y2:        y2,
+			WordSpans: wordSpans,
 		})
 	}
 	return out
+}
+
+func detectWordSpansInBand(
+	img image.Image,
+	xMin, xMax, yMin, yMax, step int,
+	darkThreshold uint32,
+) []syntheticWordSpan {
+	if img == nil || xMax <= xMin || yMax <= yMin {
+		return nil
+	}
+	b := img.Bounds()
+	w := b.Dx()
+	h := b.Dy()
+	if w <= 0 || h <= 0 {
+		return nil
+	}
+
+	xMin = clampInt(xMin, 0, w-1)
+	xMax = clampInt(xMax, xMin+1, w-1)
+	yMin = clampInt(yMin, 0, h-1)
+	yMax = clampInt(yMax, yMin+1, h-1)
+	step = maxInt(1, step)
+
+	cols := ((xMax - xMin + 1) + step - 1) / step
+	rows := ((yMax - yMin + 1) + step - 1) / step
+	if cols <= 0 || rows <= 0 {
+		return nil
+	}
+
+	colDark := make([]int, cols)
+	for x := xMin; x <= xMax; x += step {
+		cx := (x - xMin) / step
+		if cx < 0 || cx >= cols {
+			continue
+		}
+		dark := 0
+		for y := yMin; y <= yMax; y += step {
+			r, g, bl, a := img.At(x+b.Min.X, y+b.Min.Y).RGBA()
+			if a == 0 {
+				continue
+			}
+			luma := (299*r + 587*g + 114*bl) / 1000
+			if luma < darkThreshold {
+				dark++
+			}
+		}
+		colDark[cx] = dark
+	}
+
+	colThreshold := maxInt(1, rows/8)
+	active := make([]bool, cols)
+	activeCount := 0
+	for i, c := range colDark {
+		if c >= colThreshold {
+			active[i] = true
+			activeCount++
+		}
+	}
+	if activeCount == 0 {
+		return nil
+	}
+
+	type run struct{ s, e int }
+	runs := make([]run, 0, activeCount/2)
+	start := -1
+	gap := 0
+	maxGap := 1
+	for i := 0; i < cols; i++ {
+		if active[i] {
+			if start < 0 {
+				start = i
+			}
+			gap = 0
+			continue
+		}
+		if start >= 0 {
+			gap++
+			if gap > maxGap {
+				end := i - gap
+				if end >= start {
+					runs = append(runs, run{s: start, e: end})
+				}
+				start = -1
+				gap = 0
+			}
+		}
+	}
+	if start >= 0 {
+		runs = append(runs, run{s: start, e: cols - 1})
+	}
+	if len(runs) == 0 {
+		return nil
+	}
+
+	spans := make([]syntheticWordSpan, 0, len(runs))
+	for _, r := range runs {
+		spanPad := maxInt(1, step/2)
+		wx1 := float64(clampInt(xMin+(r.s*step)-spanPad, 0, w-2))
+		wx2 := float64(clampInt(xMin+((r.e+1)*step)+spanPad, 1, w-1))
+		if wx2-wx1 < maxFloat(1.0, float64(step)*1.6) {
+			continue
+		}
+		spans = append(spans, syntheticWordSpan{X1: wx1, X2: wx2})
+	}
+	if len(spans) <= 1 {
+		return spans
+	}
+
+	// Merge tiny gaps that usually split the same visual word.
+	mergeGap := maxFloat(0.8, float64(step)*1.2)
+	merged := make([]syntheticWordSpan, 0, len(spans))
+	cur := spans[0]
+	for i := 1; i < len(spans); i++ {
+		if spans[i].X1-cur.X2 <= mergeGap {
+			cur.X2 = maxFloat(cur.X2, spans[i].X2)
+			continue
+		}
+		merged = append(merged, cur)
+		cur = spans[i]
+	}
+	merged = append(merged, cur)
+	return merged
 }
 
 func largestDenseSpan(counts []int, threshold int) (int, int, bool) {
@@ -926,6 +1456,56 @@ func largestDenseSpan(counts []int, threshold int) (int, int, bool) {
 		return 0, 0, false
 	}
 	return bestStart, bestEnd, true
+}
+
+func weightedSpan(counts []int, lowQ, highQ float64) (int, int, bool) {
+	if len(counts) == 0 {
+		return 0, 0, false
+	}
+	if lowQ < 0 {
+		lowQ = 0
+	}
+	if highQ > 1 {
+		highQ = 1
+	}
+	if highQ <= lowQ {
+		highQ = minFloat(lowQ+0.01, 1)
+	}
+
+	total := 0
+	for _, c := range counts {
+		if c > 0 {
+			total += c
+		}
+	}
+	if total <= 0 {
+		return 0, 0, false
+	}
+
+	lowTarget := int(float64(total) * lowQ)
+	highTarget := int(float64(total) * highQ)
+	cum := 0
+	start := 0
+	end := len(counts) - 1
+	foundStart := false
+	for i, c := range counts {
+		if c < 0 {
+			c = 0
+		}
+		cum += c
+		if !foundStart && cum >= lowTarget {
+			start = i
+			foundStart = true
+		}
+		if cum >= highTarget {
+			end = i
+			break
+		}
+	}
+	if end < start {
+		end = start
+	}
+	return start, end, true
 }
 
 func minFloat(a, b float64) float64 {

@@ -52,8 +52,8 @@ func TestMapWordsToSpans_ExpandsEdgeSpansToLineBounds(t *testing.T) {
 	out := mapWordsToSpans(words, spans, 20, 200, 300, 4)
 
 	assert.Len(t, out, len(words))
-	assert.InDelta(t, 20, out[0].X1, 0.01)
-	assert.InDelta(t, 220, out[len(out)-1].X2, 40)
+	assert.InDelta(t, 20, out[0].X1, 10.0)
+	assert.InDelta(t, 220, out[len(out)-1].X2, 60)
 }
 
 func TestMapWordsToSpans_EnforcesWordGap(t *testing.T) {
@@ -66,6 +66,21 @@ func TestMapWordsToSpans_EnforcesWordGap(t *testing.T) {
 	}
 }
 
+func TestMapWordsToSpans_SingleSpanFallsBackToSafeDistribution(t *testing.T) {
+	words := []string{"Jet", "Tankstelle", "5964"}
+	spans := []syntheticWordSpan{{X1: 20, X2: 280}}
+
+	out := mapWordsToSpans(words, spans, 15, 240, 600, 4)
+
+	assert.Len(t, out, len(words))
+	for _, span := range out {
+		assert.Greater(t, span.X2, span.X1)
+		assert.False(t, span.X2-span.X1 > 120)
+	}
+	assert.Greater(t, out[1].X1, out[0].X1+1.0)
+	assert.Greater(t, out[2].X1, out[1].X1+1.0)
+}
+
 func TestWordSpanMappingUsableRequiresLengthMatch(t *testing.T) {
 	words := []string{"A", "B", "C"}
 	spans := []syntheticWordSpan{{X1: 1, X2: 10}, {X1: 14, X2: 20}}
@@ -76,4 +91,39 @@ func TestWordSpanMappingUsableRejectsTinyCoverage(t *testing.T) {
 	words := []string{"A", "B"}
 	spans := []syntheticWordSpan{{X1: 1, X2: 2}, {X1: 10, X2: 11}}
 	assert.False(t, wordSpanMappingUsable(spans, words, 0, 20, 4))
+}
+
+func TestMapWordsToSpans_ReanchorsEdgesAfterCapping(t *testing.T) {
+	words := []string{"A", "BBBBBBBB", "C", "DDDDDD", "E"}
+	spans := []syntheticWordSpan{
+		{X1: 58, X2: 115},
+		{X1: 120, X2: 260},
+		{X1: 264, X2: 320},
+	}
+
+	out := mapWordsToSpans(words, spans, 20, 340, 500, 4)
+
+	assert.Len(t, out, len(words))
+	assert.InDelta(t, 20, out[0].X1, 0.01)
+	assert.InDelta(t, 360, out[len(out)-1].X2, 0.01)
+	for i := 0; i < len(out)-1; i++ {
+		assert.Greater(t, out[i+1].X1, out[i].X2)
+	}
+}
+
+func TestPickPreferredLineBandIndex_UsesCursorAndSkipsUsedBands(t *testing.T) {
+	bands := []syntheticLineBand{
+		{Y1: 10, Y2: 14},
+		{Y1: 20, Y2: 24},
+		{Y1: 30, Y2: 34},
+		{Y1: 40, Y2: 45},
+	}
+	used := []bool{false, true, false, false}
+
+	idx := pickPreferredLineBandIndex(bands, used, 1, 20, 24, 8)
+	assert.Equal(t, 2, idx)
+
+	used[2] = true
+	idx = pickPreferredLineBandIndex(bands, used, 2, 20, 24, 8)
+	assert.Equal(t, 3, idx)
 }

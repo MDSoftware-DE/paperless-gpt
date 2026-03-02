@@ -421,6 +421,8 @@ func buildSyntheticHOCRPage(
 	// Accept a broader ratio window: line-band detection is often slightly over/under
 	// segmented, but still good enough to anchor word-level x positions.
 	useBands := len(scaledBands) >= minBandsRequired && bandRatio >= 0.70 && bandRatio <= 1.35
+	bandUsed := make([]bool, len(scaledBands))
+	bandCursor := 0
 
 	// Strict but non-destructive vertical text corridor.
 	// Keep bottom close to the synthetic layout area to avoid clipping long documents.
@@ -478,8 +480,21 @@ func buildSyntheticHOCRPage(
 		lineSpaceWidth := maxFloat(lineCharWidth*1.12, 2.0)
 		mappedWordSpans := []syntheticWordSpan(nil)
 		if useBands {
-			bi := mapLineIndex(renderedLines, nonEmptyLines, len(scaledBands))
+			preferredCursor := bandCursor
+			if ratioIdx := mapLineIndex(renderedLines, nonEmptyLines, len(scaledBands)); ratioIdx > preferredCursor {
+				preferredCursor = minInt(ratioIdx, len(scaledBands)-1)
+			}
+			bi := pickPreferredLineBandIndex(
+				scaledBands,
+				bandUsed,
+				preferredCursor,
+				fallbackY1,
+				fallbackY2,
+				dynAdvance,
+			)
 			if bi >= 0 && bi < len(scaledBands) {
+				bandUsed[bi] = true
+				bandCursor = maxInt(bandCursor, bi+1)
 				band := scaledBands[bi]
 				// Keep X placement stable from the synthetic model to avoid horizontal jitter.
 				// Use detected bands only as a bounded vertical hint.
@@ -530,7 +545,8 @@ func buildSyntheticHOCRPage(
 		}
 
 		// Enforce monotonic line progression; overlapping lines make UI text selection unreliable.
-		minY1 := lastY2 + maxFloat(1.4, dynAdvance*0.75)
+		minLineGap := clampFloat(dynAdvance*0.14, 0.8, 2.6)
+		minY1 := lastY2 + minLineGap
 		if y1 < minY1 {
 			shift := minY1 - y1
 			y1 += shift
@@ -551,12 +567,22 @@ func buildSyntheticHOCRPage(
 		y2 = clampFloat(maxFloat(y2, y1+2.2), y1+2.2, textBottom)
 
 		// Prevent accidental bleed into neighboring lines when selection is rendered by PDF viewers.
-		lineMaxHeight := dynAdvance * 0.4
+		lineMaxHeight := clampFloat(dynAdvance*0.62, 2.2, maxFloat(2.2, dynAdvance*0.92))
 		if y2-y1 > lineMaxHeight {
 			y2 = y1 + lineMaxHeight
 		}
 		if y2 > textBottom {
 			y2 = textBottom
+		}
+		if y2-y1 < 2.2 {
+			y2 = minFloat(y1+2.2, textBottom)
+		}
+		if y1 < minY1 {
+			y1 = minY1
+			y2 = minFloat(maxFloat(y2, y1+2.2), textBottom)
+		}
+		if y2 <= y1+1.4 {
+			break
 		}
 
 		// Keep the final rendered line strictly inside the visible text corridor.
@@ -578,6 +604,7 @@ func buildSyntheticHOCRPage(
 			fallbackLineEnd = mappedWordSpans[len(mappedWordSpans)-1].X2
 		}
 
+		useFallbackWords := len(mappedWordSpans) == 0
 		wordObjs := make([]hocr.Word, 0, len(words))
 		for wIdx, word := range words {
 			charCount := maxInt(utf8.RuneCountInString(word), 1)
@@ -589,6 +616,10 @@ func buildSyntheticHOCRPage(
 				ww := maxFloat(float64(charCount)*lineCharWidth, lineCharWidth)
 				x1 = fallbackLineSpaceX
 				x2 = minFloat(x1+ww, fallbackLineEnd)
+				if useFallbackWords && wIdx == len(words)-1 {
+					x2 = fallbackLineEnd
+					x1 = minFloat(x1, maxFloat(lineMarginX, x2-ww))
+				}
 				fallbackLineSpaceX = minFloat(x2+lineSpaceWidth, fallbackLineEnd)
 			}
 			if x1 >= w-2 {
@@ -673,6 +704,91 @@ func mapLineIndex(lineIdx, totalLines, totalBands int) int {
 	return clampInt(idx, 0, totalBands-1)
 }
 
+func pickPreferredLineBandIndex(
+	bands []syntheticLineBand,
+	used []bool,
+	cursor int,
+	fallbackY1, fallbackY2, dynAdvance float64,
+) int {
+	if len(bands) == 0 {
+		return -1
+	}
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor >= len(bands) {
+		cursor = len(bands) - 1
+	}
+	expectedCenter := (fallbackY1 + fallbackY2) / 2
+	bestIdx := -1
+	bestScore := 1e9
+
+	lookAhead := minInt(len(bands), cursor+5)
+	for i := cursor; i < lookAhead; i++ {
+		if i < 0 || i >= len(used) || used[i] {
+			continue
+		}
+		score := lineBandDistanceScore(bands[i], expectedCenter, dynAdvance)
+		if score < bestScore {
+			bestScore = score
+			bestIdx = i
+		}
+	}
+	if bestIdx >= 0 {
+		return bestIdx
+	}
+
+	maxDist := maxFloat(dynAdvance*2.4, 14.0)
+	for i := 0; i < len(bands); i++ {
+		if i >= len(used) || used[i] {
+			continue
+		}
+		center := (bands[i].Y1 + bands[i].Y2) / 2
+		dist := center - expectedCenter
+		if dist < 0 {
+			dist = -dist
+		}
+		if dist > maxDist {
+			continue
+		}
+		score := lineBandDistanceScore(bands[i], expectedCenter, dynAdvance)
+		if score < bestScore {
+			bestScore = score
+			bestIdx = i
+		}
+	}
+	if bestIdx >= 0 {
+		return bestIdx
+	}
+
+	for i := cursor; i < len(bands); i++ {
+		if i < len(used) && !used[i] {
+			return i
+		}
+	}
+	for i := 0; i < len(bands); i++ {
+		if i < len(used) && !used[i] {
+			return i
+		}
+	}
+	return -1
+}
+
+func lineBandDistanceScore(b syntheticLineBand, expectedCenter, dynAdvance float64) float64 {
+	center := (b.Y1 + b.Y2) / 2
+	dist := center - expectedCenter
+	if dist < 0 {
+		dist = -dist
+	}
+	targetH := maxFloat(dynAdvance*0.58, 2.2)
+	bandH := maxFloat(b.Y2-b.Y1, 1.0)
+	heightDelta := bandH - targetH
+	if heightDelta < 0 {
+		heightDelta = -heightDelta
+	}
+	return dist + (heightDelta * 0.25)
+}
+
 func mapWordsToSpans(
 	words []string,
 	spans []syntheticWordSpan,
@@ -703,7 +819,9 @@ func mapWordsToSpans(
 	}
 
 	out := base
-	if len(clean) > 0 {
+	// Use detected spans only when they are informative.
+	// A single span usually covers full/near-full lines and causes over-wide words.
+	if len(clean) > 1 {
 		if warped := warpWordSpansToGlyphSpans(base, clean, estimatedCharWidth); len(warped) == len(base) {
 			out = warped
 		}
@@ -742,6 +860,57 @@ func mapWordsToSpans(
 			out[len(out)-1].X2 = lineEnd
 		}
 	}
+	maxSpanPerWord := maxFloat(lineWidth/float64(maxInt(len(out), 1))*1.8, minSpanWidth)
+	softMaxScale := maxFloat(estimatedCharWidth*2.6, 4.8)
+	for i, w := range words {
+		if i >= len(out) {
+			break
+		}
+		charCount := maxInt(utf8.RuneCountInString(w), 1)
+		capWidth := maxSpanPerWord
+		if capByChars := softMaxScale * float64(charCount); capByChars > 0 {
+			capWidth = minFloat(capWidth, capByChars)
+		}
+		if out[i].X2-out[i].X1 > capWidth {
+			center := (out[i].X1 + out[i].X2) / 2
+			half := capWidth / 2
+			out[i].X1 = maxFloat(center-half, lineStart)
+			out[i].X2 = minFloat(center+half, lineEnd)
+		}
+	}
+	if len(out) > 0 {
+		firstWidth := maxFloat(out[0].X2-out[0].X1, minSpanWidth)
+		out[0].X1 = lineStart
+		out[0].X2 = minFloat(lineStart+firstWidth, lineEnd)
+		last := len(out) - 1
+		lastWidth := maxFloat(out[last].X2-out[last].X1, minSpanWidth)
+		out[last].X2 = lineEnd
+		out[last].X1 = maxFloat(lineStart, lineEnd-lastWidth)
+	}
+
+	for i := 1; i < len(out); i++ {
+		if out[i].X1 <= out[i-1].X2+0.9 {
+			out[i].X1 = out[i-1].X2 + 0.9
+		}
+		if out[i].X2 <= out[i].X1+1.1 {
+			out[i].X2 = minFloat(out[i].X1+1.1, lineEnd)
+		}
+	}
+	if len(out) > 0 {
+		out[0].X1 = lineStart
+		if out[0].X2 <= out[0].X1+1.1 {
+			out[0].X2 = minFloat(out[0].X1+1.1, lineEnd)
+		}
+		last := len(out) - 1
+		lastWidth := maxFloat(out[last].X2-out[last].X1, 1.1)
+		out[last].X2 = lineEnd
+		out[last].X1 = maxFloat(lineStart, lineEnd-lastWidth)
+		if last > 0 && out[last].X1 <= out[last-1].X2+0.9 {
+			out[last].X1 = minFloat(lineEnd-1.1, out[last-1].X2+0.9)
+			out[last].X2 = lineEnd
+		}
+	}
+
 	return out
 }
 
@@ -751,13 +920,6 @@ func warpWordSpansToGlyphSpans(
 	estimatedCharWidth float64,
 ) []syntheticWordSpan {
 	if len(base) == 0 || len(spans) == 0 {
-		return base
-	}
-	if len(spans) == 1 {
-		span := spans[0]
-		for i := range base {
-			base[i] = span
-		}
 		return base
 	}
 
